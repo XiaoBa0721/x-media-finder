@@ -1,0 +1,19 @@
+# x-media-finder 的 Python 侧依赖（只给 x_worker.py 用）
+#
+# 安装（用机器人实际会调用的那个解释器）：
+#     python -m pip install -r requirements.txt
+#
+# ⚠️ 这个技能是"JS 入口 + Python 子进程"结构：Node 侧不需要 npm 依赖
+#    （全部走 Node 内置模块），Python 侧只装下面这些。
+
+# X/Twitter 搜索客户端：自带账号池、限频管理、登录态 sqlite 存储。
+# 必须 >=0.12，早期版本的 search() 不带 filter:media 支持。
+twscrape>=0.12.0
+
+# twscrape 的传递依赖里 httpx 是核心；显式列出下限，
+# 避免某些镜像源解析出太老的版本（0.23 以下没有 http2 支持）。
+httpx>=0.24.0
+
+# 账号登录（twscrape login_accounts 内部用到）—— 部分版本按需导入，
+# 显式装上免得运行时才报 ModuleNotFoundError。
+python-dateutil>=2.8.2
