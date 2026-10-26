@@ -1,0 +1,29 @@
+# 本地环境覆盖（含作者自己的工具路径与代理）
+paths.json
+
+# 账号库与缓存
+accounts.db
+data/
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 测试与开发笔记（不进仓库）
+DEVNOTES.md
+*test*.mjs
+*test*.py
+selftest*
+preflight*
+
+# 构建产物
+dist/
+
+# 日志与临时
+*.log
+_*.txt
+_*.json
+.DS_Store
+Thumbs.db
