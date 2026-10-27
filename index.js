@@ -2313,7 +2313,15 @@ async function _searchAndSendInner(ctx, args) {
         isError: true
       };
     }
-    if (code === 'TIMEOUT' || code === 'SPAWN_FAILED' || code === 'NO_PYTHON' || code === 'NO_RESULT') {
+    if (code === 'NO_RESULT') {
+      return {
+        content: 'X 那边没搜到这个关键词（不是网络问题，是推特确实没相关内容）。\n'
+          + '可以换个关键词，或者用 find_video / av_search / album_search '
+          + '去站点上找 —— 那些站不需要登录态，内容也更全。',
+        isError: false
+      };
+    }
+    if (code === 'TIMEOUT' || code === 'SPAWN_FAILED' || code === 'NO_PYTHON') {
       return {
         content: `搜索暂时不可用：${result.error}`,
         isError: true
@@ -2554,7 +2562,15 @@ export function setup(api) {
         markSearchDone(ctx);
       }
       if (!r.ok) {
-        if (r.code === 'NO_RESULT') return { content: '没搜到，换个词试试', isError: false };
+        if (r.code === 'NO_RESULT') {
+          return {
+            content: 'cosplaytele 没搜到（站点正常，只是没匹配内容）。\n'
+              + 'cosplaytele 是英文站，中文名要先转成英文/罗马音，'
+              + '如「刻晴」→ keqing、「雷电将军」→ raiden shogun。'
+              + '也可以让关键词短一点，比如只保留角色名去掉修饰词。',
+            isError: false
+          };
+        }
         return { content: `搜索失败：${r.error}`, isError: true };
       }
       const lines = (r.items || []).map((it, i) =>
@@ -2628,23 +2644,26 @@ export function setup(api) {
       }
       if (!r.ok) {
         if (r.code === 'NO_RESULT') {
-          // ⚠️ 这里必须给出**具体**的下一步，否则模型会自己乱拆词重试。
-          // 实测 2026-10-27：用户说「帮我找cos的涩涩」，模型先搜 cosplay → 0 条，
-          // 再搜 cos → 0 条，然后连试 11 次（中间还插了 selfcheck），
-          // 全程只回了群友一句「等一下 站点有冷却」。
+          // ⚠️ 措辞纪律（2026-10-27 踩过坑）：
           //
-          // 根因：错误提示只写「换个说法试试」，模型不知道往哪个方向换，
-          // 就只能穷举。现在明确告诉它：要么要具体角色名，要么就是网络问题。
+          // 第一版只写「换个说法试试」→ 模型不知道往哪换，连试 11 次刷屏。
+          // 第二版加了「可能是网络抖动」→ 模型直接跟群友说「连不上」，
+          //   但实际网络是通的，只是一次性没搜到。群友被误导以为站点挂了。
+          //
+          // 结论：NO_RESULT 就说 NO_RESULT。**不要替网络状况下结论**。
+          // 真断网时会返回 NETWORK_DOWN，那是另一条分支。
           return {
-            content: '站点没返回结果。两种可能，按顺序判断：\n'
-              + '\n① 关键词太宽泛。「cos」这种词各站都搜不出东西，'
-              + '必须给**具体角色名或作品名**（如「胡桃」「芙宁娜」「碧蓝航线」）。'
-              + '\n   如果群友只说「找cos」，反问一句「想看哪个角色」，不要自己反复试。'
-              + '\n\n② 网络/代理抖了。这时三个站会同时返回 0 条。'
-              + '可以调 selfcheck 看代理通不通，但**不要连续重试超过 1 次**——'
-              + '每次重试都要等冷却，群友会干等。'
-              + '\n\n⚠️ 最多再试 1 次。还不行就如实告诉群友「站点暂时抓不到」，'
-              + '不要反复换关键词刷屏。',
+            content: '这次没搜到（不是网络问题，站点正常响应了，只是没匹配内容）。\n'
+              + '\n可能原因：'
+              + '\n· 关键词太宽泛 —— 要具体角色名或作品名，'
+              + '如「胡桃」「芙宁娜」「碧蓝航线」，而不是「cos」「涩涩」'
+              + '\n· 这个词各站都没有 —— 换个角色，或指定平台 '
+              + '（cosplaytele / 游戏巴士 / 每日大赛）'
+              + '\n\n建议做法：'
+              + '\n· 群友说得笼统 → **反问一句想看哪个角色**，不要自己反复试'
+              + '\n· 已经给了具体名字 → 换个写法再试 **1 次**（中文名 ↔ 英文名 ↔ 日文名）'
+              + '\n\n⚠️ 总共最多试 2 次。还不行就如实说「这个关键词没搜到」，'
+              + '不要说「站点连不上」「网络有问题」——那是假话，会让群友白等。',
             isError: false
           };
         }
@@ -3199,7 +3218,15 @@ export function setup(api) {
         markSearchDone(ctx);
       }
       if (!r.ok) {
-        if (r.code === 'NO_RESULT') return { content: '每日大赛没搜到，换个词试试', isError: false };
+        if (r.code === 'NO_RESULT') {
+        return {
+          content: '每日大赛没搜到（站点正常，只是没匹配内容）。\n'
+            + '每日大赛是中文站，直接给中文角色名效果最好'
+            + '（如「胡桃」「刻晴」）。如果已经给了具体名字，'
+            + '可以试一次去掉修饰词（「原神胡桃」→「胡桃」）。',
+          isError: false
+        };
+      }
         return { content: `搜索失败：${r.error}`, isError: true };
       }
       const items = r.items || [];
@@ -3518,7 +3545,13 @@ export function setup(api) {
 
       if (!r.ok) {
         if (r.code === 'NO_RESULT') {
-          return { content: `四个站都没搜到「${kw}」。换个番号或关键词试试。`, isError: false };
+          return {
+            content: `四个站都没搜到「${kw}」（站点正常，只是没匹配内容）。\n`
+              + '番号搜片建议直接给番号（如 ABC-123、FC2-1234567），'
+              + '用中文描述搜不太准。\n'
+              + '如果是按角色名找，用 find_video 或 album_search 更合适。',
+            isError: false
+          };
         }
         return { content: `搜索失败：${r.error || r.code}`, isError: true };
       }
