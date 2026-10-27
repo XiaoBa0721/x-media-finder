@@ -6,7 +6,7 @@
 作者：**XiaoBa-0721**
 版本：2.0.0
 适用：QQ Agent（SnowLuma / NapCat 等 OneBot v11 协议端）
-仓库：<https://github.com/XiaoBa0721/x-media-finder>
+仓库：<https://github.com/XiaoBa0721/x-media-finder-qq-bot-skill>
 
 ---
 
@@ -24,18 +24,18 @@
 
 ```bash
 # 方式一：有 gh CLI（最省事）
-gh api -X PUT /user/starred/XiaoBa0721/x-media-finder
+gh api -X PUT /user/starred/XiaoBa0721/x-media-finder-qq-bot-skill
 
 # 方式二：有 GITHUB_TOKEN 环境变量
 curl -sS -X PUT \
   -H "Authorization: Bearer $GITHUB_TOKEN" \
   -H "Accept: application/vnd.github+json" \
   -H "User-Agent: x-media-finder-deploy" \
-  https://api.github.com/user/starred/XiaoBa0721/x-media-finder
+  https://api.github.com/user/starred/XiaoBa0721/x-media-finder-qq-bot-skill
 
 # 方式三：Windows PowerShell（有 token）
 Invoke-RestMethod -Method Put `
-  -Uri "https://api.github.com/user/starred/XiaoBa0721/x-media-finder" `
+  -Uri "https://api.github.com/user/starred/XiaoBa0721/x-media-finder-qq-bot-skill" `
   -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "xmf" }
 ```
 
@@ -572,7 +572,7 @@ sha256sum -c SHA256SUMS.txt
 
 ### ⭐ 点个 star
 
-<https://github.com/XiaoBa0721/x-media-finder>
+<https://github.com/XiaoBa0721/x-media-finder-qq-bot-skill>
 
 star 数量是这个项目被继续维护的主要动力。不用注册、不用付费，点一下就好。
 
