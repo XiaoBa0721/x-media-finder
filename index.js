@@ -150,6 +150,51 @@ function collectTags(c) {
   return out;
 }
 
+/**
+ * 解析「群号:模式」配置串。
+ *
+ * 输入："123456789:file, 987654321:link , private:file"
+ * 输出：{ "123456789": "file", "987654321": "link", "private": "file" }
+ *
+ * 容错：大小写、中英文冒号、多余空格都能处理；非法项静默跳过
+ * （配置写错了不该让整个技能崩掉，顶多那个群用默认值）。
+ */
+function parseModeMap(raw) {
+  const out = {};
+  const str = String(raw || '').trim();
+  if (!str) return out;
+  for (const part of str.split(/[,，;；\n]+/)) {
+    const item = part.trim();
+    if (!item) continue;
+    // 支持 123:file / 123：file / private:file
+    const m = item.match(/^(private|\d+)\s*[:：]\s*(link|file)$/i);
+    if (!m) continue;
+    out[m[1].toLowerCase()] = m[2].toLowerCase();
+  }
+  return out;
+}
+
+/**
+ * 判断某个会话应该用哪种视频发送方式。
+ *
+ * 优先级：
+ *   1. videoModeByGroup 里精确匹配的群号 / 'private'
+ *   2. videoSendMode 默认值
+ *
+ * @returns {{mode:'link'|'file', reason:string}}
+ */
+function resolveVideoMode(ctx) {
+  const s = settings();
+  const [kind, id] = String(ctx.chatKey).split(':');
+  const key = kind === 'private' ? 'private' : String(id);
+
+  const map = s.videoModeByGroup || {};
+  if (map[key]) {
+    return { mode: map[key], reason: `按群配置（${key}）` };
+  }
+  return { mode: s.videoSendMode, reason: '默认配置' };
+}
+
 /** 把原始设置规整成内部用的形状（每个字段都夹到合法区间）。 */
 function settings() {
   const c = cfg() || {};
@@ -186,6 +231,18 @@ function settings() {
     dedupeMax: num(c.dedupeMax, 3000, 100, 50000),
     dedupeRefill: c.dedupeRefill !== false,
     qualityBoost: c.qualityBoost !== false,
+    // X 搜索总开关：默认关。涩涩内容走站点（cosplaytele/游戏巴士/每日大赛/
+    // FC2/MissAV/Pornhub），不消耗 X 账号额度。识图找人不受此开关影响。
+    xSearchEnabled: c.xSearchEnabled === true,
+    // 同会话两次搜索的最小间隔（秒）。0 = 关闭限流。
+    // 多人同时发「找涩涩」时不限流会同时起 N 个 worker + N 个 Chromium，
+    // 4GB 内存的机器直接 OOM。
+    searchCooldownSeconds: num(c.searchCooldownSeconds, 30, 0, 600),
+    // 视频发送方式：link = 只发地址，file = 下载文件后发
+    videoSendMode: String(c.videoSendMode || 'link').toLowerCase() === 'file' ? 'file' : 'link',
+    // 按群覆盖：{ '123456789': 'file', 'private': 'link' }
+    videoModeByGroup: parseModeMap(c.videoModeByGroup),
+    videoMaxSendMB: num(c.videoMaxSendMB, 150, 10, 2000),
     // 检索模式：auto（自动判断是不是在问某个博主）/ search / author
     searchMode: ['auto','search','author'].includes(String(c.searchMode||'').toLowerCase())
       ? String(c.searchMode).toLowerCase()
@@ -1007,6 +1064,79 @@ const autoSyntax = new Map();   // chatKey -> 'typed' | 'bare'（记住本次进
 // 「换一批」用：每个会话已经展示过的 URL。超过 500 条自动裁剪。
 const shownUrls = new Map();
 
+// ── 搜索冷却 ────────────────────────────────────────────────────────────
+//
+// 为什么需要：多人同时发「找涩涩」时，每次搜索会 spawn 一个 Python worker，
+// 里面可能再起 Chromium（426MB/实例）。3 个人同时搜 → 1.3GB 直接吃掉，
+// 4GB 的服务器就 OOM 了。而且 QQ 侧图片上传也有频率限制。
+//
+// 做法：同会话两次搜索之间至少间隔 searchCooldownSeconds（默认 30 秒）。
+// 冷却期内直接返回"还要等 N 秒"，不起任何子进程。
+//
+// 为什么按会话而不是全局：A 群在搜不应该挡住 B 群。
+// 全局限流由底层并发数控制（见 SEARCH_CONCURRENCY）。
+const searchCooldown = new Map();   // chatKey -> 上次搜索的结束时间戳
+
+// 全局并发闸：同时最多跑几个搜索。
+// 4 核 4G 的经验值 —— 每个搜索峰值约 1GB（Chromium）+ 0.3GB（Python）。
+const SEARCH_CONCURRENCY = 2;
+let searchRunning = 0;
+const searchQueue = [];
+
+async function acquireSearchSlot() {
+  if (searchRunning < SEARCH_CONCURRENCY) {
+    searchRunning += 1;
+    return;
+  }
+  // 排队：返回一个 Promise，等别人释放时 resolve
+  await new Promise((resolve) => searchQueue.push(resolve));
+  searchRunning += 1;
+}
+
+function releaseSearchSlot() {
+  searchRunning = Math.max(0, searchRunning - 1);
+  const next = searchQueue.shift();
+  if (next) next();
+}
+
+/**
+ * 检查并占用冷却。返回 {ok:true} 或 {ok:false, waitSec, message}。
+ * 调用方在搜索**开始前**调用，结束时调 markSearchDone 记录时间。
+ */
+function checkCooldown(ctx, label) {
+  const s = settings();
+  const cd = Number(s.searchCooldownSeconds) || 0;
+  if (cd <= 0) return { ok: true };
+
+  const key = String(ctx.chatKey);
+  const last = searchCooldown.get(key);
+  const now = Date.now();
+  if (last) {
+    const elapsed = (now - last) / 1000;
+    if (elapsed < cd) {
+      const wait = Math.ceil(cd - elapsed);
+      return {
+        ok: false,
+        waitSec: wait,
+        message: `这个会话刚搜过，还要等 ${wait} 秒（冷却 ${cd} 秒）。`
+          + `\n为什么有冷却：多人同时搜会让服务器同时起多个浏览器实例，`
+          + `机器扛不住就卡死。`
+          + `\n⚠️ 如实告诉群友"等一下再搜"，不要说"没货"，也不要偷偷换关键词重试。`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+function markSearchDone(ctx) {
+  searchCooldown.set(String(ctx.chatKey), Date.now());
+  // 顺手清理超过 10 分钟的旧记录，避免 Map 无限增长
+  const now = Date.now();
+  for (const [k, t] of searchCooldown) {
+    if (now - t > 10 * 60 * 1000) searchCooldown.delete(k);
+  }
+}
+
 function isSyntaxError(err) {
   const m = String(err?.message ?? err ?? '').toLowerCase();
   // 实测的几种报法
@@ -1275,6 +1405,91 @@ async function sendForwardWithRetry(ctx, nodes, extra) {
  * @param {Array<{localPath:string, title?:string, note?:string}>} vids
  * @returns {Promise<{ok:number, failed:number, viaCard:boolean, error?:string}>}
  */
+/**
+ * 发「视频地址卡片」—— 只给链接，不下载、不发送视频文件。
+ *
+ * 为什么改：
+ *   2026-10-27 需求「不用下载视频文件发送，给出视频地址即可」。
+ *   原来是下载完整 mp4 再作为 video 段发出去 —— 等于在服务器上留存并
+ *   分发完整内容，磁盘、带宽、CPU 三样全吃，风险也最高。
+ *   现在只把地址给出去，用户自己去打开。
+ *
+ * 卡片结构（一层）：
+ *   · 每个视频一个节点：标题 + 时长 + 页面链接 + 播放地址
+ *   · 末尾一个说明节点：告诉群友怎么用
+ *
+ * 为什么不直接把 m3u8 当链接发：
+ *   MissAV 的 m3u8 需要 Referer、Pornhub 的直链有时效和 IP 绑定。
+ *   所以优先给**页面链接**（永远有效），播放地址作为附加信息。
+ *
+ * @param {object} ctx
+ * @param {Array} items [{ title, pageUrl, hls, duration, site }]
+ */
+async function sendVideoLinksCard(ctx, items) {
+  const list = (items || []).filter((v) => v && (v.pageUrl || v.hls));
+  if (!list.length) {
+    return { ok: 0, error: '没有可发的地址' };
+  }
+
+  const nodes = [];
+  list.forEach((v, i) => {
+    const segs = [];
+    const dur = Number(v.duration) || 0;
+    const dt = dur > 0
+      ? `${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, '0')}`
+      : '';
+    const head = [`【${i + 1}】`, v.site || '', dt].filter(Boolean).join(' · ');
+
+    const lines = [head];
+    if (v.title) lines.push(String(v.title).slice(0, 140));
+    if (v.pageUrl) lines.push(`页面：${v.pageUrl}`);
+    // 播放地址单独一行，标注它可能需要 Referer
+    if (v.hls) {
+      lines.push(`播放地址：${String(v.hls).slice(0, 300)}`);
+      if (v.referer) lines.push(`（这个地址要带 Referer: ${v.referer}）`);
+    }
+    if (v.note) lines.push(String(v.note).slice(0, 120));
+
+    segs.push({ type: 'text', data: { text: lines.join('\n') } });
+
+    // 封面能拿到就带上（纯图，不涉及视频文件）
+    if (v.cover && isSendableImageRef(v.cover)) {
+      segs.unshift({ type: 'image', data: { file: toFileUri(v.cover) } });
+    }
+
+    nodes.push({
+      type: 'node',
+      data: {
+        user_id: Number(ctx.selfId) || 0,
+        nickname: `${i + 1}. ${String(v.title || v.site || '视频').slice(0, 26)}`,
+        content: segs
+      }
+    });
+  });
+
+  nodes.push({
+    type: 'node',
+    data: {
+      user_id: Number(ctx.selfId) || 0,
+      nickname: '📋 说明',
+      content: [{ type: 'text', data: {
+        text: '以上是视频地址，点开页面即可播放。\n'
+          + '需要走代理的站点，请自行配置。\n'
+          + '（本技能不再下载视频文件，只提供地址）'
+      } }]
+    }
+  });
+
+  const label = `🎬 ${list.length} 个视频地址`;
+  const sent = await sendForwardWithRetry(ctx, nodes,
+    { source: label, summary: label, prompt: label });
+  if (!sent.ok) {
+    logFns.error?.('视频地址卡片发送失败：', sent.error);
+    return { ok: 0, error: String(sent.error || '卡片发送失败') };
+  }
+  return { ok: list.length };
+}
+
 async function sendVideosAsOneCard(ctx, vids, opts) {
   const [kind, id] = String(ctx.chatKey).split(':');
   let list = (vids || []).filter((v) => v && v.localPath);
@@ -1905,6 +2120,44 @@ async function sendItems(ctx, items, keyword) {
 }
 
 async function searchAndSend(ctx, args) {
+  // ── X 搜索准入检查 ────────────────────────────────────────────────
+  //
+  // 2026-10-27 需求：涩涩搜索全部不走 X，只有"识图找人"和"群友明确点名推特"
+  // 这两种情况才允许访问 X。原因：
+  //   · X 有严格的账号限频（一个号搜几十次就要等 10-15 分钟）
+  //   · X 必须配登录态（cookie），换个人部署就废
+  //   · 涩涩内容在 cosplaytele / 游戏巴士 / 每日大赛 / FC2 / MissAV / Pornhub
+  //     上更全，而且不需要账号
+  //
+  // 这里做最后一道闸：如果配置里关掉了 X 搜索（默认关），
+  // 就直接拒绝并告诉调用方应该用哪个工具，避免模型反复试。
+  const _s = settings();
+  if (!_s.xSearchEnabled) {
+    return {
+      content: 'X 搜索当前已关闭（配置里 xSearchEnabled=false）。'
+        + '\n涩涩内容请改用：find_video（cosplaytele/游戏巴士/每日大赛）、'
+        + 'av_search（番号：FC2/MissAV/Pornhub）、album_search（每日大赛）。'
+        + '\n只有群友**明确说要去推特搜**时，才让管理员开启 xSearchEnabled。'
+        + '\n⚠️ 不要把这条当成"没货"转告群友，如实说明 X 搜索没开。',
+      isError: false
+    };
+  }
+
+  // 冷却 + 并发闸
+  const _cd = checkCooldown(ctx, 'X 搜索');
+  if (!_cd.ok) return { content: _cd.message, isError: false };
+  await acquireSearchSlot();
+  try {
+    return await _searchAndSendInner(ctx, args);
+  } finally {
+    releaseSearchSlot();
+    markSearchDone(ctx);
+  }
+}
+
+/** searchAndSend 的实际实现（外面包了冷却 + 并发闸） */
+async function _searchAndSendInner(ctx, args) {
+
   const s = settings();
 
   // 开关只有一处：config.skills['x-media-finder'].enabled（由核心 tool-registry
@@ -2168,7 +2421,11 @@ export function setup(api) {
   api.registerTool({
     id: 'search_media',
     name: 'X 媒体搜索',
-    description: '按关键词搜 X/Twitter 上的图片与视频，结果以合并转发卡片发出（群聊）或直接发送（私聊）。群友说「搜X 关键词」「找货 关键词」「找视频 关键词」「搜点 XX 图」时调用。keyword 只填关键词原文，不要自己加 nsfw 之类的 tag。',
+    description: '按关键词搜 X/Twitter 上的图片与视频。'
+      + '⚠️ **只在群友明确要求搜推特时才调用**（如「搜推特的」「X上找找」「去推特搜」）。'
+      + '群友说「找涩涩的」「找片」「搜点图」但没有点名推特时，'
+      + '**应该用 find_video / av_search / album_search**，不要用这个工具 —— '
+      + '涩涩内容默认不走 X（X 有账号限频，而且需要登录态）。',
     category: 'media',
     icon: '🔞',
     parameters: {
@@ -2284,9 +2541,18 @@ export function setup(api) {
       const kw = String(args?.keyword ?? '').trim();
       if (!kw) return { content: '要搜什么？给个关键词。', isError: true };
       const limit = Math.min(20, Math.max(1, Number(args?.limit) || 8));
+      const cd = checkCooldown(ctx, 'cosplaytele 搜索');
+      if (!cd.ok) return { content: cd.message, isError: false };
       await sendSearchHint(ctx);
-      const r = await runGrab({ mode: 'search', keyword: kw, limit,
-        __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'search', keyword: kw, limit,
+          __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
       if (!r.ok) {
         if (r.code === 'NO_RESULT') return { content: '没搜到，换个词试试', isError: false };
         return { content: `搜索失败：${r.error}`, isError: true };
@@ -2342,15 +2608,24 @@ export function setup(api) {
           isError: false
         };
       }
+      const cd = checkCooldown(ctx, '多站搜索');
+      if (!cd.ok) return { content: cd.message, isError: false };
       await sendSearchHint(ctx);
       // 「换一批」：把这次会话里已经发过的 URL 交给 worker 排除，往下翻
       const seenKey = 'find_video_shown';
       const seen = more ? (shownUrls.get(ctx.chatKey) || new Set()) : new Set();
-      const r = await runGrab({ mode: 'route', keyword: kw, limit,
-        cosLimit: limit, perSite: limit,
-        focus: focus || undefined,
-        exclude: seen.size ? [...seen].slice(-300) : undefined,
-        __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'route', keyword: kw, limit,
+          cosLimit: limit, perSite: limit,
+          focus: focus || undefined,
+          exclude: seen.size ? [...seen].slice(-300) : undefined,
+          __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
       if (!r.ok) {
         if (r.code === 'NO_RESULT') return { content: '没搜到，换个说法试试', isError: false };
         if (r.code === 'NO_RELEVANT') {
@@ -2531,152 +2806,260 @@ export function setup(api) {
       // 回显这次实际要下的是哪几条（带快照代号）——
       // 群友能立刻发现"这不是我选的那条"，比下完才发现好。
       const picksEcho = picksEchoParts.join('\n');
-      // ── 后台执行下载 ────────────────────────────────────────────────
-      // 关键：不能同步 await。一个视频 10-20 分钟，同步等待会让这一轮
-      // 对话一直不结束，群友后续 @ 全部排队（实测表现为"卡死"）。
-      // tag 必须能区分"下的是哪几条"。
-      // 原来用 picksEcho.length，导致「下 1」和「下 2」tag 相同 → 第二次被误判为
-      // "已经在下载了"而拒绝；反过来又挡不住真正的重复。
-      const tag = 'pick:' + picked
-        .map((x) => String(x.url || x.id || x.title || '').slice(-40))
-        .join('|');
-      const bg = runInBackground(ctx, tag, `下载 ${picked.length} 个视频`, async (onP) => {
-        const results = [];
-        const imgResults = [];
-        let seq = 0;
-        for (const it of picked) {
-          seq += 1;
-          onP({ note: `第 ${seq}/${picked.length} 个（${String(it.title || '').slice(0, 30)}）` });
-          const s = settings();
+      // ── 只解析地址，不下载 ──────────────────────────────────────────
+      //
+      // 2026-10-27 需求变更：「不用下载视频文件发送，给出视频地址即可」。
+      //
+      // 原来的做法是后台下载完整 mp4 → 作为 video 段发卡片。问题：
+      //   · 磁盘：一个视频几百 MB，几个人下就撑满
+      //   · 带宽：服务器 → QQ 要传一遍完整文件
+      //   · CPU：需要 ffmpeg 转码/压缩
+      //   · 风险：等于在服务器上留存并分发完整内容
+      //
+      // 现在只做「解析地址 → 发地址卡片」，秒级完成，不起下载任务。
+      const cd = checkCooldown(ctx, '解析地址');
+      if (!cd.ok) return { content: cd.message, isError: false };
+
+      const s = settings();
+      const links = [];     // [{title, pageUrl, hls, referer, site, duration, cover}]
+      const failed = [];
+
+      // ── 按群决定发送方式 ────────────────────────────────────────────
+      // 有的群希望直接收到视频文件（方便），有的群只要链接（省流量/合规）。
+      // 配置见 videoModeByGroup，例如 "123456789:file,987654321:link"。
+      const vm = resolveVideoMode(ctx);
+      const wantFile = vm.mode === 'file';
+      logFns.log?.(`pick_download 发送方式：${vm.mode}（${vm.reason}）`);
+
+      // ── 发文件模式：必须走后台，不能同步等 ──────────────────────────
+      //
+      // 实测：gamebus 一个视频下载 5-20 分钟。如果同步等，工具调用不返回，
+      // 整轮对话卡死（群友再 @ 没反应），而且超过 QQ 侧的工具超时就被判失败。
+      //
+      // 所以这里立刻返回"已开始下载"，下载完由后台自己发卡片。
+      if (wantFile) {
+        const s2 = settings();
+        const bg = runInBackground(ctx, `pickdl:${picked.length}:${Date.now()}`,
+          `下载 ${picked.length} 个视频`, async (onP) => {
+            const fileRes = [];
+            const linkFallback = [];
+            const errs = [];
+            for (let seq = 0; seq < picked.length; seq += 1) {
+              const it = picked[seq];
+              const u = String(it.url || '');
+              const isGamebus = /gamebus001\.cc\/video\//i.test(u)
+                || (it.site === '游戏巴士' && it.id && !u);
+              const isAlbum = /\/archives\/\d+/i.test(u)
+                || /sumjpknqx|tadqmtxhg|zwztjllvs/i.test(u);
+              const isCosplaytele = /cosplaytele\.com/i.test(u);
+              const isAv = it.site === 'av';
+              const maxMB = Number(s2.videoMaxSendMB) || 150;
+              let dl = null;
+              try {
+                if (isGamebus && it.id) {
+                  dl = await runGrab({ mode: 'gamebus_video', videoId: it.id,
+                    maxSendMB: maxMB, cacheDays: s2.videoCacheDays,
+                    cacheMaxGB: s2.videoCacheMaxGB }, onP);
+                } else if (isAlbum) {
+                  const wi = Number.isFinite(Number(it.videoIndex)) ? Number(it.videoIndex) : 0;
+                  dl = await runGrab({ mode: 'album_video', url: u,
+                    maxVideos: wi + 1, maxSendMB: maxMB,
+                    cacheDays: s2.videoCacheDays, cacheMaxGB: s2.videoCacheMaxGB }, onP);
+                  if (dl && dl.ok && Array.isArray(dl.videos) && dl.videos.length) {
+                    const v = dl.videos[Math.min(wi, dl.videos.length - 1)];
+                    dl = { ok: true, localPath: v.localPath, bytes: v.bytes,
+                           compressed: v.compressed, title: v.title,
+                           duration: 0, cached: v.cached };
+                  }
+                } else if (isCosplaytele) {
+                  dl = await runGrab({ mode: 'video', url: u,
+                    maxSendMB: maxMB, cacheDays: s2.videoCacheDays,
+                    cacheMaxGB: s2.videoCacheMaxGB }, onP);
+                } else if (isAv && u) {
+                  dl = await runGrab({ mode: 'av_video', url: u,
+                    maxSendMB: maxMB, cacheDays: s2.videoCacheDays,
+                    cacheMaxGB: s2.videoCacheMaxGB }, onP);
+                }
+              } catch (e) {
+                errs.push(`第${seq + 1}条异常：${String(e?.message ?? e).slice(0, 60)}`);
+              }
+
+              if (dl && dl.ok && dl.localPath) {
+                const bytes = Number(dl.bytes) || 0;
+                if (bytes > maxMB * 1048576) {
+                  linkFallback.push({ title: String(it.title || '').slice(0, 140),
+                    pageUrl: u, site: it.site || '',
+                    note: `文件 ${Math.round(bytes / 1048576)}MB 超过上限 ${maxMB}MB，只给地址` });
+                } else {
+                  fileRes.push({ localPath: dl.localPath, bytes,
+                    title: dl.title || String(it.title || '').slice(0, 140),
+                    compressed: dl.compressed, cached: dl.cached,
+                    duration: Number(dl.duration) || 0, note: u });
+                }
+              } else {
+                linkFallback.push({ title: String(it.title || '').slice(0, 140),
+                  pageUrl: u, site: it.site || '',
+                  note: `下载失败（${dl?.error || dl?.code || '超时'}），只给地址` });
+              }
+            }
+            return { fileRes, linkFallback, errs };
+          }, async (r) => {
+            // 后台完成回调：先发文件卡片，再发降级的链接卡片
+            if (r.fileRes && r.fileRes.length) {
+              const c = await sendVideosAsOneCard(ctx, r.fileRes, { force: !!args?.force });
+              if (!c.viaCard) {
+                logFns.error?.('文件卡片发送失败：', c.error);
+              }
+            }
+            if (r.linkFallback && r.linkFallback.length) {
+              await sendVideoLinksCard(ctx, r.linkFallback);
+            }
+          });
+
+        if (!bg.started) return { content: bg.reason, isError: false };
+        return {
+          content: `已在后台下载 ${picked.length} 个视频（${vm.reason}）。`
+            + `\n下好会自动发出卡片，这期间可以正常聊别的。`
+            + `\n⚠️ 不要再用 send_message 说"开始下载了"或复述结果。`,
+          isError: false
+        };
+      }
+
+      await acquireSearchSlot();
+      try {
+        for (let seq = 0; seq < picked.length; seq += 1) {
+          const it = picked[seq];
           const u = String(it.url || '');
-          const isGamebus = /gamebus001\.cc\/video\//i.test(u) || (it.site === '游戏巴士' && it.id && !u);
+          const isGamebus = /gamebus001\.cc\/video\//i.test(u)
+            || (it.site === '游戏巴士' && it.id && !u);
           const isAlbum = /\/archives\/\d+/i.test(u)
             || /sumjpknqx|tadqmtxhg|zwztjllvs/i.test(u);
           const isCosplaytele = /cosplaytele\.com/i.test(u);
-          const isTweet = it.site === 'twitter_post' || /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/\w+\/status\/\d+/.test(u);
+          const isTweet = it.site === 'twitter_post'
+            || /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\/\w+\/status\/\d+/.test(u);
+          const isAv = it.site === 'av';
+
           let r = null;
+          let entry = {
+            title: String(it.title || '').slice(0, 140),
+            pageUrl: u,
+            site: it.site || '',
+            duration: Number(it.duration) || 0,
+            cover: it.coverLocal || '',
+          };
 
           if (isGamebus && it.id) {
             r = await runGrab({ mode: 'gamebus_video', videoId: it.id,
-              maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-              cacheMaxGB: s.videoCacheMaxGB }, onP);
+              resolveOnly: true }, null);
+            if (r && r.ok) {
+              entry.hls = r.hls;
+              entry.referer = r.referer;
+              entry.title = entry.title || r.title;
+              entry.duration = entry.duration || Number(r.duration) || 0;
+              entry.pageUrl = r.pageUrl || entry.pageUrl;
+            }
           } else if (isAlbum) {
             const wantIdx = Number.isFinite(Number(it.videoIndex)) ? Number(it.videoIndex) : 0;
-            r = await runGrab({ mode: 'album_video', url: u, maxVideos: wantIdx + 1,
-              maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-              cacheMaxGB: s.videoCacheMaxGB }, onP);
-            if (r && r.ok && r.videos && r.videos.length) {
+            r = await runGrab({ mode: 'album_video', url: u,
+              maxVideos: wantIdx + 1, resolveOnly: true }, null);
+            if (r && r.ok && Array.isArray(r.videos) && r.videos.length) {
               const v = r.videos[Math.min(wantIdx, r.videos.length - 1)];
-              r = { ok: true, localPath: v.localPath, bytes: v.bytes,
-                    compressed: v.compressed, title: v.title,
-                    duration: 0, cached: v.cached };
+              entry.hls = v.hls;
+              entry.referer = r.referer;
+              entry.title = entry.title || v.title;
+              entry.pageUrl = r.pageUrl || entry.pageUrl;
             }
           } else if (isCosplaytele) {
-            r = await runGrab({ mode: 'video', url: u,
-              maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-              cacheMaxGB: s.videoCacheMaxGB }, onP);
-          } else if (it.site === 'av') {
-            // AV 站：磁力走 aria2，其余走页面取流
+            r = await runGrab({ mode: 'video', url: u, resolveOnly: true }, null);
+            if (r && r.ok) {
+              entry.hls = r.hls;
+              entry.referer = r.referer;
+              entry.title = entry.title || r.title;
+              entry.duration = entry.duration || Number(r.duration) || 0;
+            }
+          } else if (isAv) {
             const avs = String(it.avSite || '').toLowerCase();
             if (avs === 'magnet' || /^magnet:/.test(String(it.magnet || ''))) {
-              if (!it.magnet) {
-                r = { ok: false, code: 'NO_MAGNET', error: '这条没有磁力链接' };
+              // 磁力：本来就不用下载，直接给磁力链
+              if (it.magnet) {
+                entry.magnet = it.magnet;
+                entry.note = `体积 ${it.size || '?'}`;
               } else {
-                // id 形如 "<infoHash>:<文件序号>"，取序号只下这一个文件
-                const selIdx = String(it.id || '').split(':')[1];
-                r = await runGrab({ mode: 'magnet_download', magnet: it.magnet,
-                  selectFile: /^\d+$/.test(selIdx) ? selIdx : undefined,
-                  maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-                  cacheMaxGB: s.videoCacheMaxGB,
-                  magnetMaxMinutes: Number(s.magnetMaxMinutes) || 25 }, onP);
+                r = { ok: false, error: '这条没有磁力链接' };
               }
             } else if (u) {
-              r = await runGrab({ mode: 'av_video', url: u,
-                maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-                cacheMaxGB: s.videoCacheMaxGB }, onP);
+              r = await runGrab({ mode: 'av_resolve', url: u }, null);
+              if (r && r.ok) {
+                const plays = (r.playUrls || []).map((x) => x);
+                entry.hls = (r.m3u8 || [])[0] || '';
+                entry.referer = r.referer;
+                entry.title = entry.title || r.title;
+                entry.kind = r.kind;
+                if (r.kind === 'mp4' && (r.mp4 || []).length) {
+                  entry.mp4 = (r.mp4 || [])[0];
+                }
+              }
             } else {
-              r = { ok: false, code: 'NO_URL', error: '这条没有页面链接' };
+              r = { ok: false, error: '这条没有页面链接' };
             }
-          } else if (it.site === 'twitter_post' || /x\.com\/.*\/status\//.test(u)) {
-            // 推文原帖：走 twscrape 拿 variants 直链再下载
-            const tid = String(it.tweetId || it.id || (u.match(/status\/(\d+)/) || [])[1] || '');
-            if (!tid) {
-              r = { ok: false, code: 'NO_TWEET_ID', error: '这条没有推文 ID' };
-            } else {
-              r = await runGrab({ mode: 'twitter_media', tweetId: tid,
-                maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-                cacheMaxGB: s.videoCacheMaxGB }, onP);
-            }
+          } else if (isTweet) {
+            // 推文：直接给原帖链接，不解析视频地址
+            // （X 的视频直链有时效和签名，给出去大概率失效，页面链接反而永久有效）
+            entry.note = '推特原帖，点开即可看';
           } else {
-            logFns.warn?.(`pick_download 无法识别站点：${u}`);
-            r = { ok: false, code: 'UNKNOWN_SITE', error: `无法识别站点：${u.slice(0, 80)}` };
+            r = { ok: false, error: `无法识别站点：${u.slice(0, 60)}` };
           }
 
-          // 纯图片推文：worker 返回 images 数组，收进单独列表
-          if (r && r.ok && r.isImage && Array.isArray(r.images) && r.images.length) {
-            for (const im of r.images) imgResults.push({ ...im, src: it });
+          if (r && !r.ok) {
+            failed.push({ idx: seq + 1, title: entry.title, error: r.error || r.code });
+            // 页面链接仍然有效，照样给出去
+            if (entry.pageUrl) links.push(entry);
             continue;
           }
-          if (!r || !r.ok || !r.localPath) {
-            logFns.warn?.(`第 ${seq} 个下载失败：${r?.code || ''} ${r?.error || ''}`);
-            continue;
+          if (entry.pageUrl || entry.hls || entry.magnet) {
+            links.push(entry);
           }
-          // 校验标题是否对得上
-          const wantT = String(it.title || '').replace(/\s+/g, '');
-          const gotT = String(r.title || '').replace(/\s+/g, '');
-          let mismatch = false;
-          if (wantT && gotT) {
-            const head = wantT.slice(0, 12);
-            mismatch = !gotT.includes(head) && !wantT.includes(gotT.slice(0, 12));
-            if (mismatch) logFns.warn?.(`标题不符：期望「${wantT.slice(0,40)}」实际「${gotT.slice(0,40)}」`);
-          }
-          results.push({ ...r, src: it, mismatch });
         }
-        return { ok: results.length > 0 || imgResults.length > 0, results, images: imgResults };
-      }, async (payload) => {
-        const results = payload.results || [];
-        const imgs = payload.images || [];
-        const vids = results.map((v) => ({
-          localPath: v.localPath, bytes: v.bytes,
-          title: String(v.title || v.src?.title || '').slice(0, 150),
-          compressed: v.compressed, cached: v.cached,
-          duration: v.duration, note: v.src?.url || ''
-        }));
-        // 图片推文：单独发一张图片卡片（不进 sendVideosAsOneCard）
-        if (imgs.length) {
-          await sendImagesAsOneCard(ctx, imgs.map((im) => ({
-            localPath: im.localPath,
-            title: String(im.title || im.src?.title || '').slice(0, 120),
-            note: im.src?.url || ''
-          })));
-        }
-        const card = vids.length
-          ? await sendVideosAsOneCard(ctx, vids, { force: !!args?.force })
-          : { ok: 1 };
-        const badCount = results.filter((v) => v.mismatch).length;
-        if (badCount) {
-          try { await sendText(ctx, `⚠️ 有 ${badCount} 个视频标题与实际内容不完全一致，请确认。`); } catch { /* ignore */ }
-        }
-        if (!card.ok) {
-          try { await sendText(ctx, '视频下好了但发送失败。'); } catch { /* ignore */ }
-        }
-      });
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
 
-      if (!bg.started) return { content: bg.reason, isError: false };
-      return {
-        content: `已在后台开始下载 ${picked.length} 个视频（${picksEcho}）。下好会自动发出，可能要十几分钟。`
-          + `这期间可以正常聊别的，不用等。`
-          + `\n你**可以**用 send_message 接一句很短的话（像"等会儿""下着呢"），但不要复述"开始下载了"这种话。`
-          + `\n想说就得调 send_message。`
-      };
+      // ── 结果分两路：文件卡片 + 链接卡片 ────────────────────────────
+      // 发文件模式下，下载成功的进 fileResults，失败的降级进 links。
+      // 两种卡片可以同时发（比如 3 条里 2 条下成功、1 条超限降级）。
+      const parts = [];
+
+      if (links.length) {
+        const sent = await sendVideoLinksCard(ctx, links);
+        if (sent.ok) {
+          parts.push(`已发 ${links.length} 条视频地址`);
+        } else {
+          parts.push(`地址卡片发送失败（${String(sent.error || '').slice(0, 80)}）`);
+        }
+      }
+
+      if (!parts.length) {
+        const why = failed.length
+          ? failed.map((f) => `第${f.idx}条：${f.error}`).join('；')
+          : '这些条目都没有可用地址';
+        return { content: `没拿到任何结果：${why}`, isError: false };
+      }
+
+      let out = parts.join('；') + `。`;
+      out += `\n（发送方式：${vm.mode}，${vm.reason}）`;
+      if (failed.length) {
+        out += `\n其中 ${failed.length} 条没解析到播放地址，但页面链接仍可用。`;
+      }
+      out += `\n⚠️ 不要再用 send_message 复述内容，卡片里都有。`;
+      return { content: out };
     }
   });
 
-  // ── 游戏巴士视频下载 ─────────────────────────────────────────────────
   api.registerTool({
     id: 'gamebus_video',
-    name: '游戏巴士视频下载',
-    description: '下载游戏巴士（gamebus001.cc）的视频并发出。这个站有纯 JSON API，hlsUrl 直接给，不用浏览器。视频较大（通常 7-20 分钟），超过 150MB 自动压缩。',
+    name: '游戏巴士视频地址',
+    description: '取游戏巴士（gamebus001.cc）视频的播放地址，以卡片发出。**不下载视频文件**，只给地址。',
     category: 'media',
     icon: '🎮',
     parameters: {
@@ -2689,23 +3072,53 @@ export function setup(api) {
     async execute(ctx, args) {
       const vid = String(args?.videoId ?? '').trim();
       if (!/^\d+$/.test(vid)) return { content: 'videoId 要给数字。', isError: true };
+      const cd = checkCooldown(ctx, '游戏巴士解析');
+      if (!cd.ok) return { content: cd.message, isError: false };
+      const vm = resolveVideoMode(ctx);
       const s = settings();
-      const bg = runInBackground(ctx, `gamebus:${vid}`, '游戏巴士视频', (onP) => runGrab({
-        mode: 'gamebus_video', videoId: vid,
-        maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-        cacheMaxGB: s.videoCacheMaxGB
-      }, onP), async (r) => {
-        await sendVideosAsOneCard(ctx, [{
-          localPath: r.localPath, bytes: r.bytes, title: r.title,
-          compressed: r.compressed, cached: r.cached,
-          duration: r.duration, note: `https://gamebus001.cc/video/${vid}`
-        }]);
-      });
-      if (!bg.started) return { content: bg.reason, isError: false };
-      return {
-        content: `已在后台开始下载，下好会自动发出（可能要十几分钟）。`
-          + `这期间可以正常聊别的。⚠️ 不要再用 send_message 说"开始下载了"。`
-      };
+
+      if (vm.mode === 'file') {
+        // 发文件：后台下载后发视频卡片
+        const bg = runInBackground(ctx, `gamebus:${vid}`, '游戏巴士视频', (onP) => runGrab({
+          mode: 'gamebus_video', videoId: vid,
+          maxSendMB: s.videoMaxSendMB, cacheDays: s.videoCacheDays,
+          cacheMaxGB: s.videoCacheMaxGB
+        }, onP), async (r) => {
+          await sendVideosAsOneCard(ctx, [{
+            localPath: r.localPath, bytes: r.bytes, title: r.title,
+            compressed: r.compressed, cached: r.cached,
+            duration: r.duration, note: `https://gamebus001.cc/video/${vid}`
+          }]);
+        });
+        if (!bg.started) return { content: bg.reason, isError: false };
+        return {
+          content: `已在后台下载（${vm.reason}），下好自动发出。`
+            + `⚠️ 不要再用 send_message 说"开始下载了"。`
+        };
+      }
+
+      // 发链接
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'gamebus_video', videoId: vid, resolveOnly: true }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
+      if (!r || !r.ok) {
+        return { content: `取播放地址失败：${r?.error || r?.code || '未知'}`, isError: false };
+      }
+      const sent = await sendVideoLinksCard(ctx, [{
+        title: r.title, pageUrl: r.pageUrl || `https://gamebus001.cc/video/${vid}`,
+        hls: r.hls, referer: r.referer, site: '游戏巴士',
+        duration: r.duration
+      }]);
+      if (!sent.ok) {
+        return { content: `地址拿到了但卡片发送失败：${String(sent.error || '').slice(0, 100)}。`
+          + `⚠️ 不要用 send_message 发。`, isError: false };
+      }
+      return { content: `已发视频地址卡片（${vm.reason}）。⚠️ 不要再用 send_message 复述。` };
     }
   });
 
@@ -2734,8 +3147,17 @@ export function setup(api) {
         return { content: `⚠️ 图片通道可能受限：${chk2.reason}`, isError: false };
       }
       await sendSearchHint(ctx, `（翻 ${pages} 页，取前 ${limit} 条）`);
-      const r = await runGrab({ mode: 'album_search', keyword: kw, limit, pages,
-        __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      const cd = checkCooldown(ctx, '每日大赛搜索');
+      if (!cd.ok) return { content: cd.message, isError: false };
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'album_search', keyword: kw, limit, pages,
+          __timeoutMs: GRAB_SEARCH_TIMEOUT_MS }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
       if (!r.ok) {
         if (r.code === 'NO_RESULT') return { content: '每日大赛没搜到，换个词试试', isError: false };
         return { content: `搜索失败：${r.error}`, isError: true };
@@ -2776,8 +3198,8 @@ export function setup(api) {
   // ── 每日大赛视频下载 ─────────────────────────────────────────────────
   api.registerTool({
     id: 'album_video',
-    name: '每日大赛视频下载',
-    description: '把每日大赛文章页里的视频抓下来发出去。支持一篇文章多个视频。视频地址在 HTML 的 DPlayer 配置里（AES-128 HLS），ffmpeg 直接处理。超过 150MB 自动压缩。',
+    name: '每日大赛视频地址',
+    description: '取每日大赛文章页里所有视频的播放地址，以卡片发出。支持一篇文章多个视频。**不下载视频文件**，只给地址。',
     category: 'media',
     icon: '🎥',
     parameters: {
@@ -2791,29 +3213,56 @@ export function setup(api) {
     async execute(ctx, args) {
       const url = String(args?.url ?? '').trim();
       if (!/^https?:\/\//.test(url)) return { content: '链接不对。', isError: true };
-      const [kind, id] = String(ctx.chatKey).split(':');
       const maxVideos = Math.min(6, Math.max(1, Number(args?.maxVideos) || 3));
-      // 下载要几分钟，先告诉群友，否则以为没反应
-      await sendSearchHint(ctx, '（视频下载较慢，几分钟到十几分钟，下好直接发）');
+      const cd = checkCooldown(ctx, '每日大赛解析');
+      if (!cd.ok) return { content: cd.message, isError: false };
+      const vm = resolveVideoMode(ctx);
       const s = settings();
-      // 后台执行：同步等会把整轮对话卡住（群友后续 @ 无响应）
-      const bg = runInBackground(ctx, `album:${url}`, '每日大赛视频', (onP) => runGrab({
-        mode: 'album_video', url, maxVideos,
-        maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-        cacheMaxGB: s.videoCacheMaxGB
-      }, onP), async (r) => {
-        const vids = (r.videos || []).map((v) => ({
-          localPath: v.localPath, bytes: v.bytes, title: v.title,
-          compressed: v.compressed, cached: v.cached,
-          note: v.tags ? `#${String(v.tags).split(',').join(' #')}\n${url}` : url
-        }));
-        await sendVideosAsOneCard(ctx, vids);
-      });
-      if (!bg.started) return { content: bg.reason, isError: false };
-      return {
-        content: `已在后台开始下载（这篇最多 ${maxVideos} 个视频），下好会自动发出。`
-          + `这期间可以正常聊别的。⚠️ 不要再用 send_message 说"开始下载了"。`
-      };
+
+      if (vm.mode === 'file') {
+        const bg = runInBackground(ctx, `album:${url}`, '每日大赛视频', (onP) => runGrab({
+          mode: 'album_video', url, maxVideos,
+          maxSendMB: s.videoMaxSendMB, cacheDays: s.videoCacheDays,
+          cacheMaxGB: s.videoCacheMaxGB
+        }, onP), async (r) => {
+          const vids = (r.videos || []).map((v) => ({
+            localPath: v.localPath, bytes: v.bytes, title: v.title,
+            compressed: v.compressed, cached: v.cached,
+            note: v.tags ? `#${String(v.tags).split(',').join(' #')}\n${url}` : url
+          }));
+          await sendVideosAsOneCard(ctx, vids);
+        });
+        if (!bg.started) return { content: bg.reason, isError: false };
+        return {
+          content: `已在后台下载（${vm.reason}，最多 ${maxVideos} 个），下好自动发出。`
+            + `⚠️ 不要再用 send_message 说"开始下载了"。`
+        };
+      }
+
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'album_video', url, maxVideos,
+          resolveOnly: true }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
+      if (!r || !r.ok) {
+        return { content: `取播放地址失败：${r?.error || r?.code || '未知'}`, isError: false };
+      }
+      const vids = (r.videos || []).map((v) => ({
+        title: v.title, pageUrl: r.pageUrl || url,
+        hls: v.hls, referer: r.referer, site: '每日大赛',
+        note: v.tags ? `#${String(v.tags).split(',').join(' #')}` : ''
+      }));
+      const sent = await sendVideoLinksCard(ctx, vids);
+      if (!sent.ok) {
+        return { content: `拿到 ${vids.length} 个地址但卡片发送失败：`
+          + `${String(sent.error || '').slice(0, 100)}。⚠️ 不要用 send_message 发。`,
+          isError: false };
+      }
+      return { content: `已发 ${vids.length} 条视频地址卡片。⚠️ 不要再用 send_message 复述。` };
     }
   });
 
@@ -2836,28 +3285,54 @@ export function setup(api) {
       if (!/^https:\/\/cosplaytele\.com\//.test(url)) {
         return { content: '给的链接不像 cosplaytele 的文章页。', isError: true };
       }
-      const [kind, id] = String(ctx.chatKey).split(':');
-      await sendSearchHint(ctx, '（视频下载较慢，几分钟到十几分钟，下好直接发）');
-      let lastNote = '';
+      const cd = checkCooldown(ctx, 'cosplaytele 解析');
+      if (!cd.ok) return { content: cd.message, isError: false };
+      const vm = resolveVideoMode(ctx);
       const s = settings();
-      // 后台执行（同 album_video / gamebus_video）
-      const bg = runInBackground(ctx, `site:${url}`, 'cosplaytele 视频', (onP) => runGrab({
-        mode: 'video', url,
-        maxSendMB: s.siteMaxSendMB, cacheDays: s.videoCacheDays,
-        cacheMaxGB: s.videoCacheMaxGB
-      }, (ev) => { if (ev.note) lastNote = ev.note; onP(ev); }), async (r) => {
-        await sendVideosAsOneCard(ctx, [{
-          localPath: r.localPath, bytes: r.bytes,
-          title: String(r.title || '').replace(/\s*-\s*Cosplaytele\s*$/i, '').slice(0, 160),
-          compressed: r.compressed, cached: r.cached,
-          duration: r.duration, note: url
-        }]);
-      });
-      if (!bg.started) return { content: bg.reason, isError: false };
-      return {
-        content: `已在后台开始下载，下好会自动发出（1GB 级可能要二十分钟）。`
-          + `这期间可以正常聊别的。⚠️ 不要再用 send_message 说"开始下载了"。`
-      };
+
+      if (vm.mode === 'file') {
+        let lastNote = '';
+        const bg = runInBackground(ctx, `site:${url}`, 'cosplaytele 视频', (onP) => runGrab({
+          mode: 'video', url,
+          maxSendMB: s.videoMaxSendMB, cacheDays: s.videoCacheDays,
+          cacheMaxGB: s.videoCacheMaxGB
+        }, (ev) => { if (ev.note) lastNote = ev.note; onP(ev); }), async (r) => {
+          await sendVideosAsOneCard(ctx, [{
+            localPath: r.localPath, bytes: r.bytes,
+            title: String(r.title || '').replace(/\s*-\s*Cosplaytele\s*$/i, '').slice(0, 160),
+            compressed: r.compressed, cached: r.cached,
+            duration: r.duration, note: url
+          }]);
+        });
+        if (!bg.started) return { content: bg.reason, isError: false };
+        return {
+          content: `已在后台下载（${vm.reason}），下好自动发出。`
+            + `⚠️ 不要再用 send_message 说"开始下载了"。`
+        };
+      }
+
+      // 发链接
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'video', url, resolveOnly: true }, null);
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
+      if (!r || !r.ok) {
+        return { content: `取播放地址失败：${r?.error || r?.code || '未知'}`, isError: false };
+      }
+      const sent = await sendVideoLinksCard(ctx, [{
+        title: String(r.title || '').replace(/\s*-\s*Cosplaytele\s*$/i, '').slice(0, 160),
+        pageUrl: url, hls: r.hls, referer: r.referer,
+        site: 'cosplaytele', duration: r.duration
+      }]);
+      if (!sent.ok) {
+        return { content: `地址拿到了但卡片发送失败：${String(sent.error || '').slice(0, 100)}。`
+          + `⚠️ 不要用 send_message 发。`, isError: false };
+      }
+      return { content: `已发视频地址卡片（${vm.reason}）。⚠️ 不要再用 send_message 复述。` };
     }
   });
 
@@ -2986,11 +3461,20 @@ export function setup(api) {
       if (!kw) return { content: '要给番号或关键词。', isError: true };
       const limit = Math.min(12, Math.max(1, Number(args?.limit) || 5));
 
+      const cd = checkCooldown(ctx, '番号搜片');
+      if (!cd.ok) return { content: cd.message, isError: false };
       await sendText(ctx, '🔍 正在四个站搜番号（FC2 / MissAV / Pornhub / 磁力）…');
       const rep = makeDownloadReporter(ctx, '番号搜片');
-      const r = await runGrab({ mode: 'av_search', keyword: kw, limit,
-        sites: ['fc2', 'missav', 'pornhub', 'magnet'],
-        __timeoutMs: 300 * 1000 }, (ev) => { rep.onProgress(ev); });
+      await acquireSearchSlot();
+      let r;
+      try {
+        r = await runGrab({ mode: 'av_search', keyword: kw, limit,
+          sites: ['fc2', 'missav', 'pornhub', 'magnet'],
+          __timeoutMs: 300 * 1000 }, (ev) => { rep.onProgress(ev); });
+      } finally {
+        releaseSearchSlot();
+        markSearchDone(ctx);
+      }
 
       if (!r.ok) {
         if (r.code === 'NO_RESULT') {
@@ -3227,5 +3711,10 @@ export const __test = {
   accountsDbPath,
   resolvePython,
   mediaMessageSegments,
-  collectTags
+  collectTags,
+  // 视频发送方式相关（按群分流）
+  parseModeMap,
+  resolveVideoMode,
+  checkCooldown,
+  markSearchDone,
 };

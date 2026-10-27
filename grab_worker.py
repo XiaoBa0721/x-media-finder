@@ -2255,6 +2255,16 @@ def grab_site(task):
         hls, title, dur = gamebus_hls(vid)
         if not hls:
             return fail("NO_VIDEO", "没取到播放地址（可能是会员视频）")
+
+        # 只解析模式
+        if task.get("resolveOnly"):
+            emit({"t": "progress", "stage": "video", "done": 3, "total": 3,
+                  "note": "已拿到播放地址（只解析模式，不下载）"})
+            return emit({"t": "result", "ok": True, "resolveOnly": True,
+                         "pageUrl": GAMEBUS_BASE + "/video/" + vid,
+                         "referer": GAMEBUS_BASE + "/video/",
+                         "hls": hls, "title": title, "duration": dur})
+
         emit({"t": "progress", "stage": "video", "done": 1, "total": 4,
               "note": "开始下载，视频时长约 %d 分钟…" % max(1, dur // 60)})
         outdir = os.path.join(HERE, "data", "sitevideos")
@@ -2438,6 +2448,23 @@ def grab_site(task):
         page_title, vids = album_parse_videos(url)
         if not vids:
             return fail("NO_VIDEO", "这篇没找到视频")
+
+        # 只解析模式：把每个视频的 m3u8 地址都列出来，不下载
+        if task.get("resolveOnly"):
+            from urllib.parse import urlsplit as _us
+            _sp = _us(url)
+            _referer = "%s://%s/" % (_sp.scheme, _sp.netloc)
+            _out = []
+            for i, v in enumerate(vids[:int(task.get("maxVideos") or 3)]):
+                _out.append({"idx": i + 1, "hls": v.get("url") or "",
+                             "title": v.get("videoTitle") or page_title,
+                             "tags": v.get("tags") or ""})
+            emit({"t": "progress", "stage": "video", "done": 4, "total": 4,
+                  "note": "已拿到 %d 个播放地址（只解析模式）" % len(_out)})
+            return emit({"t": "result", "ok": True, "resolveOnly": True,
+                         "pageUrl": url, "referer": _referer,
+                         "videos": _out, "pageTitle": page_title})
+
         emit({"t": "progress", "stage": "video", "done": 1, "total": 4,
               "note": "找到 %d 个视频，开始下载第 1 个…" % len(vids)})
         outdir = os.path.join(HERE, "data", "sitevideos")
@@ -2514,6 +2541,21 @@ def grab_site(task):
         m3u8 = r.get("m3u8")
         if not m3u8:
             return fail("NO_VIDEO", "这篇没有视频")
+
+        # ── 只解析模式 ────────────────────────────────────────────────
+        # 2026-10-27 需求：不下载视频文件，只把地址给出去。
+        # 原因：下载后发送文件 = 在服务器上留存并分发完整内容，
+        # 视频地址（尤其是页面链接）风险低得多。
+        from urllib.parse import urlsplit as _us
+        _sp = _us(url)
+        _referer = "%s://%s/" % (_sp.scheme, _sp.netloc)
+        if task.get("resolveOnly"):
+            emit({"t": "progress", "stage": "video", "done": 3, "total": 3,
+                  "note": "已拿到播放地址（只解析模式，不下载）"})
+            return emit({"t": "result", "ok": True, "resolveOnly": True,
+                         "pageUrl": url, "referer": _referer,
+                         "hls": m3u8, "title": r.get("title") or "",
+                         "duration": r.get("duration") or 0})
 
         # 先查缓存
         hit = cache_lookup(m3u8)

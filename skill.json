@@ -79,7 +79,12 @@
     "videoCacheDays": 14,
     "videoCacheMaxGB": 8,
     "siteCoverMax": 6,
-    "magnetMaxMinutes": 25
+    "magnetMaxMinutes": 25,
+    "xSearchEnabled": false,
+    "searchCooldownSeconds": 30,
+    "videoSendMode": "link",
+    "videoModeByGroup": "",
+    "videoMaxSendMB": 150
   },
   "configSchema": {
     "maxResults": {
@@ -491,6 +496,40 @@
       "max": 180,
       "step": 5,
       "description": "磁力下载的时间上限。超时就停，避免一个没做种的种子把任务挂死。实测有做种的种子几秒就能拿到元数据；0 做种的永远下不下来，只能超时放弃。"
+    },
+    "xSearchEnabled": {
+      "type": "boolean",
+      "title": "允许 X/Twitter 搜索",
+      "description": "关（默认）时 search_media 会直接拒绝，让模型改用 find_video / av_search / album_search 这些不需要账号的站点。只有「识图找人」不受影响——识图走 Google Lens + twscrape 查主页，和这个开关无关。打开后涩涩搜索才会去 X，但要注意：X 有严格账号限频（一个号搜几十次就要等 10-15 分钟），且必须配好 twscrape 登录态。",
+      "default": false
+    },
+    "searchCooldownSeconds": {
+      "type": "number",
+      "title": "搜索冷却（秒）",
+      "description": "同一个群/私聊两次搜索之间的最小间隔。默认 30 秒——多人同时发「找涩涩」时如果不限流，会同时起 N 个 Python worker + N 个 Chromium 实例，机器直接卡死。设为 0 关闭限流（不建议）。",
+      "default": 30
+    },
+    "videoSendMode": {
+      "type": "enum",
+      "enum": [
+        "link",
+        "file"
+      ],
+      "title": "视频发送方式（默认）",
+      "description": "link = 只发播放地址（默认，安全、省磁盘、省带宽）；file = 下载视频文件后作为视频段发送。下面 videoModeByGroup 可以按群覆盖这个默认值。",
+      "default": "link"
+    },
+    "videoModeByGroup": {
+      "type": "string",
+      "title": "按群覆盖视频发送方式",
+      "description": "格式：群号:模式，多个用逗号分隔。例：「123456789:file,987654321:link」表示第一个群发文件、第二个群只发链接。没列出的群用上面的默认值。私聊用 private:file / private:link。⚠️ 发文件会下载完整视频到服务器（几百 MB/个），磁盘和带宽消耗大。",
+      "default": ""
+    },
+    "videoMaxSendMB": {
+      "type": "number",
+      "title": "发文件模式的体积上限（MB）",
+      "description": "只有 videoSendMode=file 的群才生效。超过这个大小自动降级为只发链接，避免下载一个 2GB 的文件把磁盘吃满。默认 150。",
+      "default": 150
     }
   },
   "prompt": {
