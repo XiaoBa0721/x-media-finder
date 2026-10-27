@@ -2378,6 +2378,27 @@ def grab_site(task):
                 # 就透传到 result，让上层在卡片说明里标注"推特限频，已跳过"。
                 pass
         if not results:
+            # 区分「关键词太泛」和「网络故障」——两者处理方式完全不同。
+            #
+            # 2026-10-27 实测：代理抖动时三个站同时返回 0 条，
+            # 上层只看到 NO_RESULT，模型就以为是关键词问题，反复换词重试 11 次。
+            #
+            # 这里做一次快速探测：如果连站点首页都打不开，那就是网络问题。
+            _net_ok = True
+            try:
+                _probe = _curl("https://gamebus001.cc", "https://gamebus001.cc/",
+                               timeout=12)
+                _net_ok = bool(_probe)
+            except Exception:
+                _net_ok = False
+
+            if not _net_ok:
+                return fail("NETWORK_DOWN",
+                            "站点连不上（代理或网络抖动）。这不是关键词问题")
+            # 网络通但没结果 → 大概率是关键词太泛
+            if len(keyword.strip()) <= 8:
+                return fail("KEYWORD_TOO_BROAD",
+                            "「%s」太宽泛了，各站都搜不出东西" % keyword)
             return fail("NO_RESULT", "都没搜到")
 
         # ── 相关性过滤 + 每站限额 ────────────────────────────────────────
