@@ -25,10 +25,12 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# ⚠️ import 必须在任何 xmf_paths.xxx 调用之前
+import xmf_paths
+
 PROXY = xmf_paths.proxy_url()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
-import xmf_paths
 
 NODE = xmf_paths.NODE
 PW_MODULE = xmf_paths._pw_module_dir(HERE)

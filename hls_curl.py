@@ -17,10 +17,12 @@ import re
 import subprocess
 import sys
 
+# ⚠️ import 必须在任何 xmf_paths.xxx 调用之前
+import xmf_paths
+
 PROXY = xmf_paths.proxy_url()
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
-import xmf_paths
 
 FFMPEG = xmf_paths.FFMPEG
 

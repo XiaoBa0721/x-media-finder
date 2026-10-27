@@ -68,6 +68,7 @@ Invoke-RestMethod -Method Put `
 - [准备 X 账号](#准备-x-账号必须)
 - [准备代理](#准备代理必须)
 - [第一次运行](#第一次运行)
+- [部署自检](#部署自检)
 - [工具说明](#工具说明)
 - [常见问题](#常见问题)
 - [发布包内容](#发布包内容)
@@ -327,6 +328,64 @@ X、MissAV、Pornhub、FC2、Google Lens 这些站在中国大陆无法直连。
 
 ---
 
+## 部署自检
+
+装完之后、正式用之前，先跑一次自检。它会检查 30+ 项，能提前发现大部分问题。
+
+```bash
+cd "<QQ Agent>/resources/app/skills/x-media-finder"
+python preflight.py --fix-hints
+```
+
+输出示例：
+
+```
+【文件】     ✅ skill.json / index.js / 各 worker 齐全
+【import】   ✅ 四个 Python worker 都能正常 import
+【依赖】     ✅ ffmpeg / node / playwright / twscrape
+【账号库】   ✅ 1 个账号，其中 1 个 active
+【代理】     ✅ http://127.0.0.1:7890（x.com HTTP 200）
+【数据目录】 ✅ 可写，剩余 183.9 GB
+【manifest】 ✅ id / name / version / apiVersion
+
+结果: 33 通过 / 0 警告 / 0 失败
+✅ 全部通过，可以正常使用
+```
+
+### 为什么需要它
+
+语法检查只能发现「写错了」，发现不了「跑起来会崩」。
+
+举个真实例子：某次改动把 `import xmf_paths` 放在了使用它的代码后面。
+`python -m py_compile` 完全通过（语法合法），但运行时第一行就
+`NameError: name 'xmf_paths' is not defined`——三个 worker 全崩，
+直到用户真的去识图才暴露。
+
+`preflight.py` 会**真正 import 每个模块**（不是 ast.parse），
+这类问题一跑就现形。
+
+### 参数
+
+| 参数 | 作用 |
+|---|---|
+| 无 | 完整检查（含代理连通性探测） |
+| `--quick` | 跳过网络探测，快 3 秒 |
+| `--json` | 机器可读输出，方便 CI |
+| `--fix-hints` | 失败项附带修复命令 |
+
+### 退出码
+
+- `0` = 通过（可能有警告）
+- `1` = 有致命问题，必须修
+
+适合放进 CI 或部署脚本：
+
+```bash
+python preflight.py --quick --json || exit 1
+```
+
+---
+
 ## 第一次运行
 
 ### 1. 自检
@@ -483,6 +542,7 @@ x-media-finder/
 ├── hls_curl.py             HLS 分片下载（对付伪装后缀）
 ├── image_source_worker.py  以图搜源
 ├── xmf_paths.py            跨平台依赖探测
+├── preflight.py            部署自检（30+ 项检查）
 ├── requirements.txt        Python 依赖
 ├── README.md               本文档
 ├── CHANGELOG.md            更新日志

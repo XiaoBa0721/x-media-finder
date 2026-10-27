@@ -41,6 +41,7 @@ INCLUDE = [
     "hls_curl.py",
     "image_source_worker.py",
     "xmf_paths.py",
+    "preflight.py",
     "requirements.txt",
     # 文档
     "README.md",
@@ -58,7 +59,6 @@ FORBIDDEN_PATTERNS = [
     r"data/",
     r"test",
     r"selftest",
-    r"preflight",
     r"\.log$",
 ]
 

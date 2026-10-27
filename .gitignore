@@ -16,7 +16,8 @@ DEVNOTES.md
 *test*.mjs
 *test*.py
 selftest*
-preflight*
+preflight-test*
+# 注意：preflight.py 是发布的自检工具，不要排除它
 
 # 构建产物
 dist/
