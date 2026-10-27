@@ -276,6 +276,74 @@ export XMF_PROXY=http://127.0.0.1:7890
 
 ---
 
+## 卡片嵌套层数
+
+**所有卡片的层数统一由 `nestDepth` 决定**，不管哪个工具发的、群聊还是私聊。
+
+| nestDepth | 结构 | 展开体验 |
+|---|---|---|
+| `2` | 合并转发 → 各条目节点 | 点开一次全展开 |
+| `3` | 合并转发 → 内容节点 → 媒体节点 → 各条目 | 点开后还要再点一次 |
+
+### 为什么会有这个配置
+
+QQ 的合并转发协议上限是 `MAX_FORWARD_DEPTH = 3`，再深会直接抛
+`forward nesting depth exceeds 3`。所以最多只能套两层壳。
+
+- **`2` 层**：浏览最快，点开就能看到全部内容
+- **`3` 层**：多一次点击，但顶层只显示一个「内容」节点，
+  适合条目很多、想让卡片本身看起来简洁的场景
+
+### 覆盖范围
+
+以下发卡路径全部遵循 `nestDepth`：
+
+| 工具 / 场景 | 发卡函数 |
+|---|---|
+| `search_media`（X 搜索） | `sendGroupCard` / `sendPrivateCard` |
+| `find_video`（多站搜索） | `sendSiteCandidates` |
+| `album_search`（每日大赛） | `sendSiteCandidates` |
+| `site_search`（cosplaytele） | `sendSiteCandidates` |
+| `av_search`（番号搜片） | 内部构造节点 |
+| `magnet_parse`（磁力解析） | 内部构造节点 |
+| `pick_download`（按编号） | `sendVideoLinksCard` / `sendVideosAsOneCard` |
+| `site_video` / `album_video` / `gamebus_video` | 同上 |
+| 识图结果 | `renderImageSourceResult` |
+| 图片卡片 | `sendImagesAsOneCard` |
+
+### 实现方式
+
+统一走 `wrapNodesByDepth(nodes, who, depth)`：
+
+```js
+// depth=2：原样返回（本来就是一层的平铺节点）
+// depth=3：全部塞进一个内层节点，再用一个包装节点托住
+function wrapNodesByDepth(nodes, who, depth) {
+  const d = Number(depth) === 3 ? 3 : (Number(depth) === 2 ? 2 : settings().nestDepth);
+  if (d !== 3) return nodes;
+  const innerNode = { type: 'node', data: { ..., content: nodes } };
+  const wrapNode = { type: 'node', data: { ..., content: [innerNode] } };
+  return [wrapNode];
+}
+```
+
+**内层节点必须 `typed`**：裸对象没有 `type` 字段，
+`isNestedNodeArray` 认不出嵌套，会导致结构被压平。
+
+### 验证方法
+
+发一张卡后在日志里看结构，或直接数节点：
+
+```
+nestDepth=2 → 顶层 2 节点，最大层数 1
+nestDepth=3 → 顶层 1 节点，最大层数 3
+   顶层: 机器人 · 内容
+   第二层: 机器人 · 媒体
+   第三层: A, B
+```
+
+---
+
 ## 按群设置视频发送方式
 
 不同群需求不一样：有的群要直接看视频，有的群只要链接（省流量、更安全）。

@@ -871,7 +871,9 @@ async function sendImagesAsOneCard(ctx, imgs) {
   }));
 
   const label = `🖼 ${list.length} 张图片`;
-  const sent = await sendForwardWithRetry(ctx, nodes, { source: label, summary: label, prompt: label });
+  const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+  const wrapped = wrapNodesByDepth(nodes, who);
+  const sent = await sendForwardWithRetry(ctx, wrapped, { source: label, summary: label, prompt: label });
   if (sent.ok) return { ok: list.length, failed: 0, viaCard: true };
   logFns.error?.('图片卡片发送失败，按配置不再降级为裸发：', sent.error);
   return { ok: 0, failed: list.length, viaCard: false, error: sent.error || '卡片发送失败' };
@@ -1028,7 +1030,9 @@ async function renderImageSourceResult(ctx, r) {
     }
 
     const src = `识图结果：${accts.length || posts.length} 个来源`;
-    const sent = await sendForwardWithRetry(ctx, nodes,
+    const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+  const wrapped = wrapNodesByDepth(nodes, who);
+  const sent = await sendForwardWithRetry(ctx, wrapped,
       { source: src, summary: src, prompt: src });
     if (!sent.ok) {
       await sendText(ctx, `识图成功但卡片发送失败：${String(sent.error || '').slice(0, 100)}。稍等重试。`);
@@ -1481,7 +1485,9 @@ async function sendVideoLinksCard(ctx, items) {
   });
 
   const label = `🎬 ${list.length} 个视频地址`;
-  const sent = await sendForwardWithRetry(ctx, nodes,
+  const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+  const wrapped = wrapNodesByDepth(nodes, who);
+  const sent = await sendForwardWithRetry(ctx, wrapped,
     { source: label, summary: label, prompt: label });
   if (!sent.ok) {
     logFns.error?.('视频地址卡片发送失败：', sent.error);
@@ -1551,7 +1557,9 @@ async function sendVideosAsOneCard(ctx, vids, opts) {
   });
 
   const label = `🎬 ${list.length} 个视频`;
-  const sent = await sendForwardWithRetry(ctx, nodes, { source: label, summary: label, prompt: label });
+  const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+  const wrapped = wrapNodesByDepth(nodes, who);
+  const sent = await sendForwardWithRetry(ctx, wrapped, { source: label, summary: label, prompt: label });
   const viaCard = sent.ok;
   const cardError = sent.ok ? '' : String(sent.error || '');
   if (sent.ok) {
@@ -1711,6 +1719,67 @@ function makeDownloadReporter(ctx, label) {
  *
  * @returns {Promise<number>} 发出的条目数
  */
+/**
+ * 把「一层节点数组」按配置的层数套壳。
+ *
+ * 问题背景（2026-10-27）：
+ *   卡片结构原来由**发起卡片的工具**决定 —— search_media 走 nestDepth，
+ *   而 find_video / pick_download / 视频卡片全都是写死的一层。
+ *   结果用户配了 nestDepth=3，却发现绝大多数卡片还是平的。
+ *   用户要求：所有卡片的层数都跟设置里一致。
+ *
+ * 协议约束：
+ *   MAX_FORWARD_DEPTH = 3。depth 从 0 开始，每进一层 content 数组 +1，
+ *   depth >= 3 直接抛 "forward nesting depth exceeds 3"。
+ *   所以「三层」= messages → 包装节点 → 内层节点 → 媒体段，
+ *   也就是最多套两层壳，不能再多。
+ *
+ * 结构对照（depth=2 时）：
+ *   messages: [节点1, 节点2, ...]          ← 直接就是各条目
+ * 结构对照（depth=3 时）：
+ *   messages: [节点1]
+ *     └ 节点1.content = [内层节点1, 内层节点2, ...]
+ *         └ 内层节点.content = [媒体段...]
+ *
+ * @param {Array} nodes 一层节点数组
+ * @param {object} who { selfId, selfNickname }
+ * @param {number} [depth] 不传就用配置的 nestDepth
+ * @returns {Array} 可直接发给协议端的 messages 数组
+ */
+function wrapNodesByDepth(nodes, who, depth) {
+  const s = settings();
+  const d = Number(depth) === 3 ? 3 : (Number(depth) === 2 ? 2 : s.nestDepth);
+  const list = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+  if (!list.length) return [];
+
+  // depth 2：原样返回（本来就是一层的平铺节点）
+  if (d !== 3) return list;
+
+  // depth 3：全部塞进一个内层节点，再用一个包装节点托住。
+  //
+  // 为什么内层必须 typed：裸对象（bare）没有 type 字段，
+  // isNestedNodeArray 认不出嵌套 —— 见 sender.js 文件头的 ⚠️。
+  const uid = Number(who?.selfId) || 0;
+  const nick = String(who?.selfNickname || '机器人');
+
+  const innerNode = {
+    type: 'node',
+    data: { user_id: uid, nickname: `${nick} · 媒体`, content: list }
+  };
+  const wrapNode = {
+    type: 'node',
+    data: { user_id: uid, nickname: `${nick} · 内容`, content: [innerNode] }
+  };
+
+  // 节点写法跟随配置：bare 时外层用裸对象。
+  // 但 bare 只能用于**最外层**，内层必须 typed，否则认不出嵌套。
+  const outSyntax = s.nodeSyntax === NODE_SYNTAX.BARE ? 'bare' : 'typed';
+  if (outSyntax === 'bare') {
+    return [{ user_id: uid, nickname: `${nick} · 内容`, content: [innerNode] }];
+  }
+  return [wrapNode];
+}
+
 async function sendSiteCandidates(ctx, items, opts) {
   const [kind, id] = String(ctx.chatKey).split(':');
   // 注意：这里**不保留** send() 裸发辅助函数。
@@ -1791,6 +1860,9 @@ async function sendSiteCandidates(ctx, items, opts) {
   // 走带重试的卡片通道（QQ 图片上传有瞬时限流，见 sendForwardWithRetry 注释）。
   // 仍然不做裸发兜底 —— 失败就把原因返回给上层。
   const src = header.slice(0, 60);
+  // 按配置的 nestDepth 统一套壳（用户要求所有卡片层数一致）
+  const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+  messages = wrapNodesByDepth(messages, who);
   const sent = await sendForwardWithRetry(ctx, messages, { source: src, summary: src, prompt: src });
   const viaCard = sent.ok;
   const cardError = sent.ok ? '' : String(sent.error || '');
@@ -2573,16 +2645,27 @@ export function setup(api) {
         }
         return { content: `搜索失败：${r.error}`, isError: true };
       }
-      const lines = (r.items || []).map((it, i) =>
-        `${i + 1}. ${it.title}\n   ${it.url}`);
+      // ── 改成发卡片 ────────────────────────────────────────────────
+      // 原来返回纯文本列表给模型，模型再 send_message 出去 ——
+      // 那样既不在卡片里，也不带封面预览。
+      // 用户要求所有内容统一进卡片、层数统一，这里改成走 sendSiteCandidates。
+      const items = Array.isArray(r.items) ? r.items : [];
+      if (!items.length) {
+        return { content: 'cosplaytele 没返回条目（站点正常，只是没匹配内容）。', isError: false };
+      }
+      const sent = await sendSiteCandidates(ctx, items, { keyword: kw });
+      if (!sent.viaCard) {
+        return {
+          content: `搜到 ${items.length} 条，但卡片发送失败：`
+            + `${String(sent.cardError || '').slice(0, 100)}。`
+            + `\n⚠️ 不要用 send_message 把内容发出去。稍等重试。`,
+          isError: false
+        };
+      }
       return {
-        content: [
-          `cosplaytele 搜到 ${r.count} 条：`,
-          '',
-          ...lines,
-          '',
-          '要下载哪个的视频，用 site_video 并把 url 填进去。'
-        ].join('\n')
+        content: `已发出卡片（cosplaytele 搜到 ${items.length} 条，含封面+标题+链接）。`
+          + `\n要视频用 site_video 并把 url 填进去；或等群友回编号用 pick_download。`
+          + `\n⚠️ 不要复述卡片内容。`
       };
     }
   });
@@ -3471,7 +3554,9 @@ export function setup(api) {
       });
 
       const src = `磁力解析：${files.length} 个文件`;
-      const sent = await sendForwardWithRetry(ctx, nodes,
+      const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+      const wrapped = wrapNodesByDepth(nodes, who);
+      const sent = await sendForwardWithRetry(ctx, wrapped,
         { source: src, summary: src, prompt: src });
 
       // 存快照：群友说「下 2」就下第 2 个文件
@@ -3598,7 +3683,9 @@ export function setup(api) {
       });
 
       const src = `番号搜索：${kw}（${items.length} 条）`;
-      const sent = await sendForwardWithRetry(ctx, nodes,
+      const who = { selfId: ctx.selfId, selfNickname: ctx.selfNickname || '机器人' };
+      const wrapped = wrapNodesByDepth(nodes, who);
+      const sent = await sendForwardWithRetry(ctx, wrapped,
         { source: src, summary: src, prompt: src });
 
       if (!sent.ok) {
@@ -3790,4 +3877,6 @@ export const __test = {
   resolveVideoMode,
   checkCooldown,
   markSearchDone,
+  // 卡片层数（统一由 nestDepth 决定）
+  wrapNodesByDepth,
 };
